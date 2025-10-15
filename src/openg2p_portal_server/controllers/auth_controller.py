@@ -30,6 +30,7 @@ from openg2p_fastapi_auth_models.schemas import (
 )
 from openg2p_fastapi_auth_models.models import LoginProvider
 from ..models import UserLoginLog, User
+from ..services import UserService
 from ..config import Settings
 
 
@@ -55,6 +56,7 @@ class AuthController(BaseController):
         super().__init__(**kwargs)
         self.router.prefix += "/auth"
         self.router.tags += ["auth"]
+        self.user_service = UserService.get_component()
 
         self.router.add_api_route(
             "/get_user_profile",
@@ -96,18 +98,22 @@ class AuthController(BaseController):
         - If online is true, the server will try to userinfo from original Authorization Server.
           Else it will return the information present in ID Token and Access token.
         """
-        if online:
-            provider = await self.get_login_provider_db_by_iss(auth.iss)
-            if provider:
-                if provider.type == LoginProviderTypes.oauth2_auth_code:
-                    return UserProfile.model_validate(
-                        await self.get_oauth_validation_data(
-                            auth, iss=auth.iss, provider=provider, combine=True
-                        )
-                    )
-                else:
-                    raise NotImplementedError()
-        return UserProfile.model_validate(auth.model_dump())
+        print(auth.sub)
+        user: User = await User.get_user_by_user_id(auth.sub)
+        user_profile: UserProfile = UserProfile.model_validate(user)
+        # return User
+        # if online:
+        #     provider = await self.get_login_provider_db_by_iss(auth.iss)
+        #     if provider:
+        #         if provider.type == LoginProviderTypes.oauth2_auth_code:
+        #             return UserProfile.model_validate(
+        #                 await self.get_oauth_validation_data(
+        #                     auth, iss=auth.iss, provider=provider, combine=True
+        #                 )
+        #             )
+        #         else:
+        #             raise NotImplementedError()
+        return user_profile
 
     async def logout(self, response: Response):
         """
@@ -173,7 +179,9 @@ class AuthController(BaseController):
                 "scope": login_provider.scope or "openid profile email",
                 "enable_pkce": login_provider.enable_pkce,
                 "code_verifier": login_provider.code_verifier or "",
-                "extra_authorize_params": orjson.loads(login_provider.extra_authorize_params or "{}"),
+                "extra_authorize_params": orjson.loads(
+                    login_provider.extra_authorize_params or "{}"
+                ),
                 # Set defaults for missing fields
                 "response_type": "code",
                 "code_challenge": "",
@@ -258,25 +266,64 @@ class AuthController(BaseController):
         auth: str | AuthCredentials,
         id_token: str = None,
         iss: str = None,
-        provider: LoginProvider = None,
+        login_provider: LoginProvider = None,
         combine=True,
     ) -> dict:
         access_token = auth.credentials if isinstance(auth, AuthCredentials) else auth
-        if not provider:
+        if not login_provider:
             if not iss:
                 iss = (
                     jwt.get_unverified_claims(access_token)["iss"]
                     if isinstance(auth, str)
                     else auth.iss
                 )
-            provider = await self.get_login_provider_db_by_iss(iss)
-        # TODO: Check if provider is None
-        auth_params = OauthProviderParameters.model_validate(
-            provider.authorization_parameters
-        )
+            login_provider = await self.get_login_provider_db_by_iss(iss)
+        provider_data = {
+                "auth_endpoint": login_provider.auth_endpoint,
+                "token_endpoint": login_provider.token_endpoint,
+                "validation_endpoint": login_provider.validation_endpoint,
+                "jwks_uri": login_provider.jwks_uri,
+                "client_id": login_provider.client_id,
+                "client_secret": login_provider.client_secret,
+                "g2p_portal_oauth_callback_url": login_provider.g2p_portal_oauth_callback_url,
+                "scope": login_provider.scope or "openid profile email",
+                "enable_pkce": login_provider.enable_pkce,
+                "code_verifier": login_provider.code_verifier or "",
+                "extra_authorize_params": orjson.loads(
+                    login_provider.extra_authorize_params or "{}"
+                ),
+                # Set defaults for missing fields
+                "client_assertion_type": OauthClientAssertionType[
+                    (
+                        "client_secret"
+                        if login_provider.client_authentication_method.startswith(
+                            "client_secret"
+                        )
+                        else login_provider.client_authentication_method
+                    )
+                ],
+                "client_assertion_jwt_aud": login_provider.jwt_assertion_aud,
+                # "client_assertion_jwk": login_provider.jwks_uri,
+                "response_type": "code",
+                "code_challenge": (
+                    base64.urlsafe_b64encode(
+                        hashlib.sha256(login_provider.code_verifier.encode("ascii")).digest()
+                    )
+                    .rstrip(b"=")
+                    .decode()
+                ),
+                "code_challenge_method": "S256",
+                "client_assertion_jwk": (
+                    base64.b64decode(login_provider.client_private_key)
+                    if login_provider.client_private_key
+                    else None
+                ),
+            }
+           
+        auth_params = OauthProviderParameters.model_validate(provider_data)
         try:
             response = httpx.get(
-                auth_params.validate_endpoint,
+                auth_params.validation_endpoint,
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             response.raise_for_status()
@@ -309,9 +356,7 @@ class AuthController(BaseController):
         if not login_provider_id:
             raise UnauthorizedError("G2P-AUT-401", "Login Provider Id not received")
 
-        login_provider = await self.get_login_provider_db_by_id(
-            login_provider_id
-        )
+        login_provider = await self.get_login_provider_db_by_id(login_provider_id)
 
         res = await self.get_tokens(login_provider, request.query_params)
 
@@ -329,12 +374,12 @@ class AuthController(BaseController):
         userinfo_dict = await self.get_oauth_validation_data(
             auth=access_token,
             id_token=id_token,
-            provider=login_provider,
+            login_provider=login_provider,
         )
 
-        id_type_config: Optional[
-            Dict[str, Any]
-        ] = await LoginProvider.get_auth_id_type_config(id=login_provider_id)
+        id_type_config: Optional[Dict[str, Any]] = (
+            await LoginProvider.get_auth_id_type_config(id=login_provider_id)
+        )
 
         user: User = await self.user_service.check_and_create_user(
             userinfo_dict, id_type_config=id_type_config
@@ -375,6 +420,11 @@ class AuthController(BaseController):
             # auth_parameters = OauthProviderParameters.model_validate(
             #     login_provider.auth_parameters
             # )
+
+            # {'client_id': 'portal-esignet', 'grant_type': 'authorization_code', 'redirect_uri': 'http://portal.openg2p.my/api/portal/auth/callback', 'code': 'EkhcFhgwyNDlktrQP9DJMM77l-W3Aa5tgXHaY0ZT_lQ', 'code_verifier': 'TZXu7a8DBGuUmJdkXvo4PnjbgBBujErMqE7Ou7joCg8', 'client_assertion_type': <OauthClientAssertionType.private_key_jwt: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'>, 'client_assertion': 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJwb3J0YWwtZXNpZ25ldCIsInN1YiI6InBvcnRhbC1lc2lnbmV0IiwiYXVkIjoiaHR0cHM6Ly9lc2lnbmV0LmRldi5vcGVuZzJwLm9yZy92MS9lc2lnbmV0L29hdXRoL3YyL3Rva2VuIiwiZXhwIjoxNzYwNTI4NTkwLCJpYXQiOjE3NjA1MjQ5OTB9.qR2hhBMHkU-ImZWPMn8O3-wpaQe0xItcBr6fHuTlYqzspMeTQlJH7mosVo5IEY0cfpV_EJ8cwI9v08qPz64nCSeBJ9RmUFENq_38jCUKbzW6FFCGXo40RTqdJD8UwPvcY2beKDOHtp60-furvFl0Ad4svTWMK2PykdzA1HUF40uwXQKeUJ9IATNQQ_ncXJArXcdbtOMeQvE9CYfSXCgaHjURe6mJxCrtEOy2gZ77mMj1inNsYgNAfvGjpQpx13CJBkvgan6Fw4EyeFATx2BLnVsxbv4SPqBqT0qlq-HZ2t5Emx59aDxgqy7n3lA0vUBUukyJQAEuhKelAiN6xPAzFA'}
+            # {'client_id': 'portal-esignet', 'grant_type': 'authorization_code', 'redirect_uri': 'http://portal.openg2p.my/api/portal/auth/callback', 'code': 'iNvJcW0S5PEoCVytJFrgA2XNLtaJEmGDpSpCzi4f2K4', 'code_verifier': 'TZXu7a8DBGuUmJdkXvo4PnjbgBBujErMqE7Ou7joCg8', 'client_assertion_type': 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', 'client_assertion': 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJwb3J0YWwtZXNpZ25ldCIsInN1YiI6InBvcnRhbC1lc2lnbmV0IiwiYXVkIjoiaHR0cHM6Ly9lc2lnbmV0LmRldi5vcGVuZzJwLm9yZy92MS9lc2lnbmV0L29hdXRoL3YyL3Rva2VuIiwiaWF0IjoxNzYwNTA1MzkxLCJleHAiOjE3NjA1MDg5OTF9.lArAfeGnMAO-WG1nBuRkjQnVgflahOxATjM1u9-_MWL14SskMszDEiQO_0qcI9si4e8CYhWwmVdm5tYvhVQ83IDDBmL6hNy2Bk6-38Dvy6RYbEni4jFriqnKEckRzrZ-SwVzdcIOzTZiVjoeECWwv87WQmgeYgw8aM3fTjATJTkEgUKI_hHUZYxmcS4B8zw254TNJJe8sJG0PglD8ClD_8WBfccsMtm-Gwb9qz1O4mhhu0jW9jycc4Hw8DJvBHjUCzs9zybxSdo6rOJseHT8iS921YVvc9mpIpwkhkvMvL28wUZthOiJ1D4YGNVduYig2gL3RwoRL0lXn5Uw3YKbWQ'}
+            # {'client_id': 'portal-esignet', 'grant_type': 'authorization_code', 'redirect_uri': 'http://portal.openg2p.my/api/portal/auth/callback', 'code': '0HrmU7RvDveOiD5eg_CPGpmSRhY_femGEQoSJTGMrMc', 'code_verifier': 'TZXu7a8DBGuUmJdkXvo4PnjbgBBujErMqE7Ou7joCg8', 'client_assertion_type': <OauthClientAssertionType.private_key_jwt: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'>, 'client_assertion': 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJwb3J0YWwtZXNpZ25ldCIsInN1YiI6InBvcnRhbC1lc2lnbmV0IiwiYXVkIjoiaHR0cHM6Ly9lc2lnbmV0LmRldi5vcGVuZzJwLm9yZy92MS9lc2lnbmV0L29hdXRoL3YyL3Rva2VuIiwiaWF0IjoxNzYwNTA2MjI5LCJleHAiOjE3NjA1MDk4Mjl9.RkhhY34ihjGDJBuHw5j_wyjxC8ZZcDo5nM7NFO8HBrGrbeFbNTelFK8aKdNYixhYiYWqOzxsnIMbRl_mQfEBSWVj0peup5oTtxDEPhAfMBtArf4pl0QL1xDAm0bIku9RcD3shoWWlgWpuRhRShHYF7Lbu23uR06wnPSYW_MusRVrUEl92fllSEWfLFdcDDkY9OTVo7xMagfF8OVVmUdaDpsDBqI6LP8uoXdVpkMDqveyyBaVeq-PaOZoZVu9a-Kdcw_LOw0Nj3y4S_7vTXgAQ9RT-4JOMQf2DCUhNCFAnF-23EzY3ib3bZcgAZpf1d0v8VOYy3fQqv_ZAhYhXbMdog'}
+
             provider_data = {
                 "auth_endpoint": login_provider.auth_endpoint,
                 "token_endpoint": login_provider.token_endpoint,
@@ -386,13 +436,76 @@ class AuthController(BaseController):
                 "scope": login_provider.scope or "openid profile email",
                 "enable_pkce": login_provider.enable_pkce,
                 "code_verifier": login_provider.code_verifier or "",
-                "extra_authorize_params": orjson.loads(login_provider.extra_authorize_params or "{}"),
+                "extra_authorize_params": orjson.loads(
+                    login_provider.extra_authorize_params or "{}"
+                ),
                 # Set defaults for missing fields
+                "client_assertion_type": OauthClientAssertionType[
+                    (
+                        "client_secret"
+                        if login_provider.client_authentication_method.startswith(
+                            "client_secret"
+                        )
+                        else login_provider.client_authentication_method
+                    )
+                ],
+                "client_assertion_jwt_aud": login_provider.jwt_assertion_aud,
+                # "client_assertion_jwk": login_provider.jwks_uri,
                 "response_type": "code",
-                "code_challenge": "",
+                "code_challenge": (
+                    base64.urlsafe_b64encode(
+                        hashlib.sha256(login_provider.code_verifier.encode("ascii")).digest()
+                    )
+                    .rstrip(b"=")
+                    .decode()
+                ),
                 "code_challenge_method": "S256",
+                "client_assertion_jwk": (
+                    base64.b64decode(login_provider.client_private_key)
+                    if login_provider.client_private_key
+                    else None
+                ),
             }
+            #     LoginProvider(
+            #     id=self.id,
+            #     name=self.name,
+            #     type=type,
+            #     description=self.name,
+            #     login_button_text=self.body or "",
+            #     login_button_image_url=self.image_icon_url or "",
+            #     authorization_parameters=OauthProviderParameters(
+            #         authorize_endpoint=self.auth_endpoint,
+            #         token_endpoint=self.token_endpoint,
+            #         validate_endpoint=self.validation_endpoint or "",
+            #         jwks_endpoint=self.jwks_uri or "",
+            #         client_id=self.client_id,
+            #         client_secret=self.client_secret,
+            #         client_assertion_type=OauthClientAssertionType[
+            #             (
+            #                 "client_secret"
+            #                 if self.client_authentication_method.startswith("client_secret")
+            #                 else self.client_authentication_method
+            #             )
+            #         ],
+            #         client_assertion_jwk=(
+            #             base64.b64decode(self.client_private_key)
+            #             if self.client_private_key
+            #             else None
+            #         ),
+            #         client_assertion_jwk_aud=self.jwt_assertion_aud,
+            #         response_type=response_type,
+            #         redirect_uri=self.g2p_portal_oauth_callback_url or "",
+            #         scope=self.scope,
+            #         enable_pkce=self.enable_pkce,
+            #         code_verifier=self.code_verifier,
+            #         extra_authorize_parameters=orjson.loads(
+            #             self.extra_authorize_params or "{}"
+            #         ),
+            #     ).model_dump(),
+            #     active=True,
+            # )
             auth_parameters = OauthProviderParameters.model_validate(provider_data)
+            print(auth_parameters," &&&&&&&&&&&&&&&&&&&&&&")
             token_request_data = {
                 "client_id": auth_parameters.client_id,
                 "grant_type": "authorization_code",
@@ -404,6 +517,7 @@ class AuthController(BaseController):
 
             token_auth = None
             if auth_parameters.client_assertion_type.name.startswith("private_key_jwt"):
+                print("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
                 await self.update_client_assertion(
                     auth_parameters, token_request_data, **kw
                 )
@@ -418,6 +532,7 @@ class AuthController(BaseController):
             ):
                 token_request_data["client_secret"] = auth_parameters.client_secret
             try:
+                print(token_request_data)
                 res = httpx.post(
                     auth_parameters.token_endpoint,
                     auth=token_auth,
@@ -446,23 +561,42 @@ class AuthController(BaseController):
             or auth_parameters.client_assertion_type
             == OauthClientAssertionType.private_key_jwt_legacy
         ):
-            iat = datetime.now(tz=timezone.utc).replace(tzinfo=None)
-            exp = iat + timedelta(hours=1)
-            client_assertion_type = (
-                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
-            )
+            print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
+            # iat = datetime.now(tz=timezone.utc).replace(tzinfo=None)
+            # exp = iat + timedelta(hours=1)
+            # client_assertion_type = (
+            #     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+            # )
+            client_assertion_type = auth_parameters.client_assertion_type
             client_assertion = jwt.encode(
                 {
                     "iss": auth_parameters.client_id,
                     "sub": auth_parameters.client_id,
                     "aud": auth_parameters.client_assertion_jwt_aud
                     or auth_parameters.token_endpoint,
-                    "iat": int(iat.timestamp()),
-                    "exp": int(exp.timestamp()),
+                    "exp": datetime.utcnow() + timedelta(hours=1),
+                    "iat": datetime.utcnow(),
                 },
                 auth_parameters.client_assertion_jwk,
                 algorithm="RS256",
             )
+            # token_request_data.update(
+            #         {
+            #             "client_assertion_type": auth_parameters.client_assertion_type,
+            #             "client_assertion": jwt.encode(
+            #                 {
+            #                     "iss": auth_parameters.client_id,
+            #                     "sub": auth_parameters.client_id,
+            #                     "aud": auth_parameters.client_assertion_jwt_aud
+            #                     or auth_parameters.token_endpoint,
+                                # "exp": datetime.utcnow() + timedelta(hours=1),
+                                # "iat": datetime.utcnow(),
+            #                 },
+            #                 auth_parameters.client_assertion_jwk,
+            #                 algorithm="RS256",
+            #             ),
+            #         }
+            #     )
         elif (
             auth_parameters.client_assertion_type
             == OauthClientAssertionType.private_key_jwt_keymanager
@@ -481,6 +615,7 @@ class AuthController(BaseController):
                 "client_assertion": client_assertion,
             }
         )
+        print(client_assertion_type, "                       888            ", client_assertion)
 
     async def generate_client_assertion_keymanager(
         self, auth_parameters: OauthProviderParameters, **kw

@@ -66,7 +66,7 @@ class UserService(BaseService):
             phone_number=validation.get("phone"),
             picture=validation.get("picture"),
             user_type=id_type_config.get("user_type"),
-            auth_provider_id=id_type_config.get("auth_provider_id"),
+            login_provider_id=id_type_config.get("auth_provider_id"),
         )
 
         user: User = await User.create_user(user_profile=user_profile)
