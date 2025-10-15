@@ -128,9 +128,9 @@ class AuthController(BaseController):
                 LoginProviderResponse(
                     id=lp.id,
                     name=lp.name,
-                    type=lp.type,
-                    displayName=lp.login_button_text,
-                    displayIconUrl=lp.login_button_image_url,
+                    type=lp.flow,
+                    displayName=lp.body,
+                    displayIconUrl=lp.image_icon_url,
                 )
                 for lp in login_providers
             ],
@@ -158,14 +158,32 @@ class AuthController(BaseController):
                 detail="Login Provider ID Not Found",
             )
 
-        if login_provider.type == LoginProviderTypes.oauth2_auth_code:
-            auth_parameters = OauthProviderParameters.model_validate(
-                login_provider.authorization_parameters
-            )
+        if login_provider.flow == LoginProviderTypes.oauth2_auth_code.value:
+            # auth_parameters = OauthProviderParameters.model_validate(
+            #     login_provider.__dict__.copy()
+            # )
+            provider_data = {
+                "auth_endpoint": login_provider.auth_endpoint,
+                "token_endpoint": login_provider.token_endpoint,
+                "validation_endpoint": login_provider.validation_endpoint,
+                "jwks_uri": login_provider.jwks_uri,
+                "client_id": login_provider.client_id,
+                "client_secret": login_provider.client_secret,
+                "g2p_portal_oauth_callback_url": login_provider.g2p_portal_oauth_callback_url,
+                "scope": login_provider.scope or "openid profile email",
+                "enable_pkce": login_provider.enable_pkce,
+                "code_verifier": login_provider.code_verifier or "",
+                "extra_authorize_params": orjson.loads(login_provider.extra_authorize_params or "{}"),
+                # Set defaults for missing fields
+                "response_type": "code",
+                "code_challenge": "",
+                "code_challenge_method": "S256",
+            }
+            auth_parameters = OauthProviderParameters.model_validate(provider_data)
             authorize_query_params = {
                 "client_id": auth_parameters.client_id,
                 "response_type": auth_parameters.response_type,
-                "redirect_uri": auth_parameters.redirect_uri,
+                "redirect_uri": auth_parameters.g2p_portal_oauth_callback_url,
                 "scope": auth_parameters.scope,
                 "nonce": secrets.token_urlsafe(),
                 "state": orjson.dumps(
@@ -185,9 +203,9 @@ class AuthController(BaseController):
                     }
                 )
 
-            authorize_query_params.update(auth_parameters.extra_authorize_parameters)
+            authorize_query_params.update(auth_parameters.extra_authorize_params)
             return RedirectResponse(
-                f"{auth_parameters.authorize_endpoint}?{urllib.parse.urlencode(authorize_query_params)}"
+                f"{auth_parameters.auth_endpoint}?{urllib.parse.urlencode(authorize_query_params)}"
             )
         else:
             raise NotImplementedError()
@@ -195,10 +213,10 @@ class AuthController(BaseController):
     async def pkce_get_or_generate_code_verifier(
         self, login_provider: LoginProvider
     ) -> str:
-        code_verifier = login_provider.authorization_parameters.get("code_verifier")
+        code_verifier = login_provider.code_verifier
         if not code_verifier:
             code_verifier = secrets.token_urlsafe(32)
-            login_provider.authorization_parameters["code_verifier"] = code_verifier
+            login_provider.code_verifier = code_verifier
             await login_provider.update_to_db()
         return code_verifier
 
@@ -291,7 +309,7 @@ class AuthController(BaseController):
         if not login_provider_id:
             raise UnauthorizedError("G2P-AUT-401", "Login Provider Id not received")
 
-        login_provider = await self.auth_controller.get_login_provider_db_by_id(
+        login_provider = await self.get_login_provider_db_by_id(
             login_provider_id
         )
 
@@ -308,7 +326,7 @@ class AuthController(BaseController):
                     seconds=expires_in
                 )
         # Check and Create User If Not Exists
-        userinfo_dict = await self.auth_controller.get_oauth_validation_data(
+        userinfo_dict = await self.get_oauth_validation_data(
             auth=access_token,
             id_token=id_token,
             provider=login_provider,
@@ -353,14 +371,32 @@ class AuthController(BaseController):
     async def get_tokens(
         self, login_provider: LoginProvider, query_params: QueryParams, **kw
     ):
-        if login_provider.type == LoginProviderTypes.oauth2_auth_code:
-            auth_parameters = OauthProviderParameters.model_validate(
-                login_provider.authorization_parameters
-            )
+        if login_provider.flow == LoginProviderTypes.oauth2_auth_code.value:
+            # auth_parameters = OauthProviderParameters.model_validate(
+            #     login_provider.auth_parameters
+            # )
+            provider_data = {
+                "auth_endpoint": login_provider.auth_endpoint,
+                "token_endpoint": login_provider.token_endpoint,
+                "validation_endpoint": login_provider.validation_endpoint,
+                "jwks_uri": login_provider.jwks_uri,
+                "client_id": login_provider.client_id,
+                "client_secret": login_provider.client_secret,
+                "g2p_portal_oauth_callback_url": login_provider.g2p_portal_oauth_callback_url,
+                "scope": login_provider.scope or "openid profile email",
+                "enable_pkce": login_provider.enable_pkce,
+                "code_verifier": login_provider.code_verifier or "",
+                "extra_authorize_params": orjson.loads(login_provider.extra_authorize_params or "{}"),
+                # Set defaults for missing fields
+                "response_type": "code",
+                "code_challenge": "",
+                "code_challenge_method": "S256",
+            }
+            auth_parameters = OauthProviderParameters.model_validate(provider_data)
             token_request_data = {
                 "client_id": auth_parameters.client_id,
                 "grant_type": "authorization_code",
-                "redirect_uri": auth_parameters.redirect_uri,
+                "redirect_uri": auth_parameters.g2p_portal_oauth_callback_url,
                 "code": query_params.get("code"),
             }
             if auth_parameters.enable_pkce:
